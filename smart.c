@@ -204,12 +204,14 @@ static int find_sg_for_block(const char *blockdev)
 
 /* 通过 SG 设备发 ATA IDENTIFY DEVICE (0xEC), 解析到 hd_driveid。
    优先发往 sysfs 关联的 sgN; 关联失败回退旧的 sg0..sg15 扫描。
-   注意: 型号字符串保持原始字节序返回, 字节交换统一在打印处做 */
+   注意: HDIO_GET_IDENTITY 在部分 BSP 内核(如 rockchip)返回已解码字符串,
+   而 SG 原始数据按 ATA 约定成对字节交换 —— 两条路径的交换处理必须
+   保持不对称(实机 A/B 验证结论, 勿"统一") */
 static int sg_identify(const char *blockdev, struct hd_driveid *hid)
 {
     char sgpath[32];
     unsigned char buf[512];
-    int n, first, v;
+    int n, first, v, w;
 
     first = find_sg_for_block(blockdev);
     for (n = -1; n < 16; n++) {
@@ -221,7 +223,15 @@ static int sg_identify(const char *blockdev, struct hd_driveid *hid)
             if (sg_ata_v(sgpath, 0xEC, buf, v, 0, 1) != 0) continue;
             /* 有效 IDENTIFY 数据: 型号区域非零 */
             if (buf[54] == 0 && buf[55] == 0) continue;
-            if (hid) memcpy(hid, buf, sizeof(*hid));
+            if (hid) {
+                memcpy(hid, buf, sizeof(*hid));
+                /* 型号 word 27-46 需字节交换(ATA 字符串约定) */
+                for (w = 0; w < 20; w++) {
+                    unsigned char t = hid->model[w * 2];
+                    hid->model[w * 2] = hid->model[w * 2 + 1];
+                    hid->model[w * 2 + 1] = t;
+                }
+            }
             return 0;
         }
     }
@@ -354,8 +364,10 @@ static int check_one_disk(const char *blockdev, int *disk_idx)
             {
                 char s[64], model[41];
                 unsigned long long cap = (unsigned long long)hid.lba_capacity_2;
-                /* 型号与序列号/固件统一在此处做 ATA 字节交换(两条读取路径一致) */
-                ata_string((unsigned char *)model, (unsigned char *)hid.model, 20);
+                /* HDIO_GET_IDENTITY 在部分 BSP 内核(如 rockchip)返回已解码字符串,
+                   直接原样使用; SG 路径的交换在 sg_identify 内做 (真机验证结论) */
+                memcpy(model, hid.model, 40);
+                model[40] = 0;
                 trim_ascii(model);
                 ata_string((unsigned char *)s, (unsigned char *)hid.serial_no, 10);
                 trim_ascii(s);
