@@ -169,46 +169,77 @@ static int sg_ata_v(const char *dev, unsigned char feature, unsigned char *buf,
     return 0;
 }
 
-/* 通过 SG 设备发 ATA IDENTIFY DEVICE (0xEC), 解析到 hd_driveid */
-static int sg_identify(struct hd_driveid *hid)
+/* 通过 sysfs 关联: 找到 blockdev(/dev/block/sdX) 对应的 /dev/sgN, 失败返回 -1。
+   /sys/block/sdX/device 与 /sys/class/scsi_generic/sgN/device 规范化后指向同一个
+   scsi_device 目录, 据此建立块设备与 SG 设备的一一对应, 避免多盘数据张冠李戴 */
+static int find_sg_for_block(const char *blockdev)
+{
+    char linkpath[64], resolved_block[512], resolved_sg[512];
+    const char *base;
+    DIR *d;
+    struct dirent *e;
+
+    base = strrchr(blockdev, '/');
+    base = base ? base + 1 : blockdev;
+    snprintf(linkpath, sizeof(linkpath), "/sys/block/%s/device", base);
+    if (!realpath(linkpath, resolved_block)) return -1;
+
+    d = opendir("/sys/class/scsi_generic");
+    if (!d) return -1;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        if (strncmp(e->d_name, "sg", 2) != 0) continue;
+        snprintf(linkpath, sizeof(linkpath), "/sys/class/scsi_generic/%s/device", e->d_name);
+        if (!realpath(linkpath, resolved_sg)) continue;
+        if (strcmp(resolved_block, resolved_sg) != 0) continue;
+        {
+            int idx = atoi(e->d_name + 2);
+            closedir(d);
+            return idx;
+        }
+    }
+    closedir(d);
+    return -1;
+}
+
+/* 通过 SG 设备发 ATA IDENTIFY DEVICE (0xEC), 解析到 hd_driveid。
+   优先发往 sysfs 关联的 sgN; 关联失败回退旧的 sg0..sg15 扫描。
+   注意: 型号字符串保持原始字节序返回, 字节交换统一在打印处做 */
+static int sg_identify(const char *blockdev, struct hd_driveid *hid)
 {
     char sgpath[32];
-    int n, r, v;
-    unsigned char buf[512], sense[32], cdb[16] = {0};
-    sg_io_hdr_t io;
-    static struct hd_driveid *out = NULL;
+    unsigned char buf[512];
+    int n, first, v;
 
-    for (n = 0; n < 16; n++) {
-        int v;
-        snprintf(sgpath, sizeof(sgpath), "/dev/sg%d", n);
+    first = find_sg_for_block(blockdev);
+    for (n = -1; n < 16; n++) {
+        if (n == first) continue; /* first=-1 时自动跳过关联轮 */
+        if (n < 0) snprintf(sgpath, sizeof(sgpath), "/dev/sg%d", first);
+        else snprintf(sgpath, sizeof(sgpath), "/dev/sg%d", n);
         for (v = 0; v < 4; v++) {
-            int w;
             /* 复用 sg_ata_v 发 IDENTIFY(0xEC), 试 4 种 CDB 变体 */
             if (sg_ata_v(sgpath, 0xEC, buf, v, 0, 1) != 0) continue;
             /* 有效 IDENTIFY 数据: 型号区域非零 */
             if (buf[54] == 0 && buf[55] == 0) continue;
-            if (hid) {
-                memcpy(hid, buf, sizeof(*hid));
-                /* 型号 word 27-46 需字节交换(ATA 字符串约定) */
-                for (w = 0; w < 20; w++) {
-                    unsigned char t = hid->model[w * 2];
-                    hid->model[w * 2] = hid->model[w * 2 + 1];
-                    hid->model[w * 2 + 1] = t;
-                }
-            }
+            if (hid) memcpy(hid, buf, sizeof(*hid));
             return 0;
         }
     }
     return -1;
 }
 
-/* 通过 SG 设备读取 SMART(USB 桥接盘), 遍历 sg0..sg15, 尝试 4 种 CDB 变体 */
-static int read_smart_sg(unsigned char *data, unsigned char *thresh)
+/* 通过 SG 设备读取 SMART(USB 桥接盘): 优先 sysfs 关联的 sgN,
+   关联失败回退扫描 sg0..sg15, 每个设备尝试 4 种 CDB 变体 */
+static int read_smart_sg(const char *blockdev, unsigned char *data, unsigned char *thresh)
 {
     char sgpath[32];
-    int n, r;
-    for (n = 0; n < 16; n++) {
-        snprintf(sgpath, sizeof(sgpath), "/dev/sg%d", n);
+    int n, first, r;
+
+    first = find_sg_for_block(blockdev);
+    for (n = -1; n < 16; n++) {
+        if (n == first) continue;
+        if (n < 0) snprintf(sgpath, sizeof(sgpath), "/dev/sg%d", first);
+        else snprintf(sgpath, sizeof(sgpath), "/dev/sg%d", n);
         r = sg_ata_v(sgpath, 0xD0, data, 0, 0, 1);
         if (r != 0) r = sg_ata_v(sgpath, 0xD0, data, 0, 1, 1);
         if (r != 0) r = sg_ata_v(sgpath, 0xD0, data, 2, 0, 1);
@@ -221,19 +252,19 @@ static int read_smart_sg(unsigned char *data, unsigned char *thresh)
     return -1;
 }
 
-static int read_smart(const char *blockdev, const char *sgdev,
-                      unsigned char *data, unsigned char *thresh)
+static int read_smart(const char *blockdev, unsigned char *data, unsigned char *thresh)
 {
     int r;
 
     /* try HDIO_DRIVE_CMD first (native SATA path) */
     r = smart_hdio(blockdev, 0xD0, data);
     if (r == 0) {
-        smart_hdio(blockdev, 0xD1, thresh);
+        /* 阈值读取失败必须清零, 避免栈上垃圾值参与健康判定 */
+        if (smart_hdio(blockdev, 0xD1, thresh) != 0) memset(thresh, 0, 512);
         return 0;
     }
     fprintf(stderr, "块设备直读失败, 尝试SG接口...\n");
-    return read_smart_sg(data, thresh);
+    return read_smart_sg(blockdev, data, thresh);
 }
 
 static const char *attr_name(int id)
@@ -296,9 +327,10 @@ static void trim_ascii(char *s)
 /* 检测单块盘并输出报告段, 返回 0=成功 1=跳过 2=有异常 */
 static int check_one_disk(const char *blockdev, int *disk_idx)
 {
-    unsigned char data[512], thresh[512], ident[512];
+    unsigned char data[512], thresh[512];
     int i, n = 0, fail = 0;
-    (void)ident;
+    memset(data, 0, sizeof(data));
+    memset(thresh, 0, sizeof(thresh));
 
     /* IDENTIFY DEVICE via HDIO_GET_IDENTITY */
     {
@@ -312,7 +344,7 @@ static int check_one_disk(const char *blockdev, int *disk_idx)
             memset(&hid, 0, sizeof(hid));
             if (ioctl(fd, HDIO_GET_IDENTITY, &hid) != 0) {
                 /* USB 桥接盘不支持 HDIO, 走 SG_IO IDENTIFY */
-                if (sg_identify(&hid) != 0) {
+                if (sg_identify(blockdev, &hid) != 0) {
                     fprintf(stderr, "设备 %s 不是ATA/SATA硬盘或无法读取: %s\n",
                             blockdev, strerror(errno));
                     close(fd);
@@ -322,17 +354,17 @@ static int check_one_disk(const char *blockdev, int *disk_idx)
             {
                 char s[64], model[41];
                 unsigned long long cap = (unsigned long long)hid.lba_capacity_2;
-                memcpy(model, hid.model, 40);
-                model[40] = 0;
+                /* 型号与序列号/固件统一在此处做 ATA 字节交换(两条读取路径一致) */
+                ata_string((unsigned char *)model, (unsigned char *)hid.model, 20);
                 trim_ascii(model);
-                ata_string(s, (unsigned char *)hid.serial_no, 10);
+                ata_string((unsigned char *)s, (unsigned char *)hid.serial_no, 10);
                 trim_ascii(s);
                 (*disk_idx)++;
                 printf("========== 硬盘 %d ==========\n", *disk_idx);
                 printf("设备路径: %s\n", blockdev);
                 printf("硬盘型号: %s\n", model);
                 printf("序列号:   %s\n", s);
-                ata_string(s, (unsigned char *)hid.fw_rev, 4);
+                ata_string((unsigned char *)s, (unsigned char *)hid.fw_rev, 4);
                 trim_ascii(s);
                 printf("固件版本: %s\n", s);
                 printf("LBA48扇区: %llu  容量 %.2f GiB (%.3f TB)\n",
@@ -344,7 +376,7 @@ static int check_one_disk(const char *blockdev, int *disk_idx)
         }
     }
 
-    if (read_smart(blockdev, "/dev/sg0", data, thresh) != 0) {
+    if (read_smart(blockdev, data, thresh) != 0) {
         fprintf(stderr, "无法读取SMART数据, 设备: %s\n", blockdev);
         return 1;
     }
@@ -355,8 +387,7 @@ static int check_one_disk(const char *blockdev, int *disk_idx)
     printf("----- SMART 健康属性 -----\n");
     for (i = 0; i < 30; i++) {
         unsigned char *a = data + 2 + i * 12;
-        unsigned char *t = thresh + 2 + i * 12;
-        int id, cur, worst, thr;
+        int id, cur, worst, thr, j;
         uint64_t raw;
         char raw_s[32];
 
@@ -364,7 +395,14 @@ static int check_one_disk(const char *blockdev, int *disk_idx)
         id = a[0];
         cur = a[3];
         worst = a[4];
-        thr = t[1];
+        /* 阈值表按属性 ID 配对(不依赖表项槽位顺序), 找不到按 0 处理 */
+        thr = 0;
+        for (j = 0; j < 30; j++) {
+            if (thresh[2 + j * 12] == id) {
+                thr = thresh[2 + j * 12 + 1];
+                break;
+            }
+        }
         raw = (uint64_t)a[5] | ((uint64_t)a[6] << 8) | ((uint64_t)a[7] << 16)
             | ((uint64_t)a[8] << 24) | ((uint64_t)a[9] << 32) | ((uint64_t)a[10] << 40);
 
@@ -426,10 +464,11 @@ static int check_one_disk(const char *blockdev, int *disk_idx)
 int main(int argc, char **argv)
 {
     int total = 0, unhealthy = 0, checked = 0;
-    int i;
+    int i, miss = 0;
 
     if (argc > 1) {
         /* 指定设备模式: smart_arm /dev/block/sdX */
+        printf("\xEF\xBB\xBF"); /* UTF-8 BOM, 与扫描模式编码一致 */
         int r = check_one_disk(argv[1], &checked);
         return (r == 2) ? 2 : (r == 0 ? 0 : 1);
     }
@@ -441,7 +480,12 @@ int main(int argc, char **argv)
         char path[32];
         int r;
         snprintf(path, sizeof(path), "/dev/block/sd%c", 'a' + i);
-        if (access(path, F_OK) != 0) break; /* sd 字母连续, 不存在即扫描结束 */
+        if (access(path, F_OK) != 0) {
+            /* sd 字母允许缺号(热插拔残留), 连续 3 个不存在视为扫描结束 */
+            if (++miss >= 3) break;
+            continue;
+        }
+        miss = 0;
         r = check_one_disk(path, &checked);
         if (r == 0) total++;
         if (r == 2) { total++; unhealthy++; }
